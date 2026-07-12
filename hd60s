@@ -1,0 +1,328 @@
+#!/bin/bash
+# HD60S ラッパースクリプト
+set -e
+cd "$(dirname "$(readlink -f "$0")")"
+
+CMD="${1:-help}"; SEC="${2:-}"
+VDEV="/dev/video42"
+ADEV="hw:10,1"
+
+# ---------- helpers ----------
+say()  { echo "[hd60s] $*"; }
+err()  { echo "[hd60s ERR] $*" >&2; }
+die()  { err "$*"; exit 1; }
+
+need_cmd() {
+    command -v "$1" >/dev/null 2>&1 || die "$1 が入ってないっぽい。'hd60s install-deps' で入れる or 'sudo apt install -y $2'"
+}
+
+need_sudo() {
+    # sudo が使えて、パスワードキャッシュされてるか / 通せるか一応確認
+    command -v sudo >/dev/null 2>&1 || die "sudo が要る"
+    sudo -n true 2>/dev/null || {
+        say "sudo パスワード要求される(先に済ませとくと快適):"
+        sudo -v || die "sudo 認証失敗"
+    }
+}
+
+ensure_iso_capture() {
+    [ -x ./iso_capture ] || die "./iso_capture がビルドされてない。'make' 走らせて"
+}
+
+ensure_snd_aloop() {
+    if ! lsmod | grep -q snd_aloop; then
+        say "snd-aloop ロード..."
+        sudo modprobe snd-aloop enable=1 index=10 id=hd60s pcm_substreams=1 || die "snd-aloop ロード失敗"
+        sleep 1
+    fi
+}
+
+ensure_v4l2loopback() {
+    if ! lsmod | grep -q v4l2loopback; then
+        say "v4l2loopback ロード..."
+        sudo modprobe v4l2loopback video_nr=42 card_label="HD60S" exclusive_caps=0 || \
+            die "v4l2loopback ロード失敗。'hd60s install-deps' で v4l2loopback-dkms 入れて"
+        sleep 1
+    fi
+    [ -e "$VDEV" ] || die "$VDEV が無い。v4l2loopback の video_nr=42 で作られる想定"
+}
+
+ensure_hd60s_device() {
+    # HD60S: VID 0fd9, PID 0074 (無印) / 0066 は別リビジョン
+    if ! lsusb 2>/dev/null | grep -qi "0fd9:0074"; then
+        die "HD60S (0fd9:0074) が USB に見つからない。ケーブル刺さってる? 電源入ってる?"
+    fi
+}
+
+set_caps() {
+    sudo v4l2loopback-ctl set-caps "$VDEV" "YUYV:1920x1080@60/1" >/dev/null 2>&1 || \
+        die "v4l2loopback-ctl set-caps 失敗 ($VDEV)"
+}
+
+kill_capture() {
+    sudo pkill -TERM -x iso_capture 2>/dev/null || true
+    sleep 1
+    sudo pkill -9 -x iso_capture 2>/dev/null || true
+}
+
+# 動作準備一括
+prep() {
+    ensure_iso_capture
+    ensure_hd60s_device
+    need_sudo
+    ensure_v4l2loopback
+    ensure_snd_aloop
+    set_caps
+}
+
+# ---------- commands ----------
+case "$CMD" in
+  live)
+    need_cmd tmux    tmux
+    need_cmd mpv     mpv
+    need_cmd arecord alsa-utils
+    need_cmd aplay   alsa-utils
+    prep
+    tmux kill-session -t hd60s 2>/dev/null || true
+    kill_capture
+    HERE="$PWD"
+    # Wayland env: tmux が session に env を継承しない場合があるので明示的に発掘
+    : "${WAYLAND_DISPLAY:=wayland-0}"
+    : "${XDG_RUNTIME_DIR:=/run/user/$(id -u)}"
+    tmux new-session -d -s hd60s -x 220 -y 55 \
+        -e "WAYLAND_DISPLAY=$WAYLAND_DISPLAY" -e "XDG_RUNTIME_DIR=$XDG_RUNTIME_DIR"
+    # ペイン1 (上): iso_capture — Ctrl+C まで無限実行 (argv[1]=0 で 100年扱い)
+    # 音声は libpipewire で直接 PipeWire ノード "hd60s-monitor" に流れる
+    tmux send-keys -t hd60s "cd $HERE && sudo XDG_RUNTIME_DIR=/run/user/\$(id -u) HD60S_INIT_TSV=analysis/init-p2-audio-fast.tsv HD60S_BURST_TSV=analysis/poststream-no9a.tsv HD60S_IT6802_RECOVER=1 HD60S_AUDIO_PW=1 ./iso_capture 0 2 5" Enter
+    # ペイン2 (下): mpv 映像プレビュー - 13秒後起動 (HD60S_NO_MPV=1 で抑制)
+    # OBS 使うなら mpv は不要 → プレビューが要らないなら NO_MPV=1 で起動しない
+    if [ -z "${HD60S_NO_MPV:-}" ]; then
+        tmux split-window -v -t hd60s
+        tmux send-keys -t hd60s "sleep 13 && mpv --vo=wlshm --untimed --profile=low-latency --no-audio --demuxer-lavf-o=input_format=yuyv422,video_size=1920x1080 av://v4l2:$VDEV" Enter
+        say "tmux 'hd60s' 起動: 上=iso_capture(無限, 音声PipeWire直結) / 下=mpvプレビュー"
+    else
+        say "tmux 'hd60s' 起動: iso_capture のみ (無限、音声PipeWire直結) — HD60S_NO_MPV=1"
+    fi
+    say "  切替: Ctrl+B → 矢印 / 抜ける: Ctrl+B → d / 全終了: Ctrl+B → q"
+    sleep 3
+    tmux attach -t hd60s
+    kill_capture
+    tmux kill-session -t hd60s 2>/dev/null || true
+    say "終了"
+    ;;
+
+  obs)
+    need_cmd obs obs-studio
+    prep
+    tmux kill-session -t hd60s 2>/dev/null || true
+    kill_capture
+    HERE="$PWD"
+    tmux new-session -d -s hd60s -x 200 -y 50
+    tmux send-keys -t hd60s "cd $HERE && sudo ./iso_capture 3600 2 5" Enter
+    say "iso_capture 起動 (tmux 'hd60s')。映像ロック待ち 12秒..."
+    sleep 12
+    say "OBS 起動..."
+    obs &
+    say "OBS 設定:"
+    echo "  ・映像キャプチャデバイス(V4L2): $VDEV / 1920x1080 / 60fps / YUYV"
+    echo "  ・音声入力キャプチャ(ALSA):     $ADEV (hd60s Loopback)"
+    ;;
+
+  start)
+    SEC="${SEC:-600}"
+    prep
+    say "iso_capture ${SEC}秒 (Ctrl+C で停止)。別窓で 'hd60s view' すると見れる"
+    exec sudo HD60S_INIT_TSV=analysis/init-p2-audio-fast.tsv HD60S_BURST_TSV=analysis/poststream-no9a.tsv HD60S_IT6802_RECOVER=1 ./iso_capture "$SEC" 2 5
+    ;;
+
+  view)
+    need_cmd vlc vlc
+    [ -e "$VDEV" ] || die "$VDEV が無い。先に 'hd60s start' で映像流して"
+    say "VLC で $VDEV + $ADEV (低遅延)..."
+    exec vlc --no-video-title-show --no-osd \
+        --v4l2-dev="$VDEV" --v4l2-chroma=YUYV \
+        --v4l2-width=1920 --v4l2-height=1080 \
+        --input-slave=alsa://$ADEV \
+        --live-caching=0 --file-caching=0 --network-caching=0 \
+        --clock-jitter=0 --clock-synchro=0 \
+        --avcodec-fast --avcodec-hw=none \
+        v4l2://$VDEV
+    ;;
+
+  view-mpv)
+    need_cmd mpv mpv
+    say "mpv で $VDEV 表示 (Wayland native)..."
+    exec mpv --vo=wlshm \
+        --demuxer-lavf-format=v4l2 \
+        --demuxer-lavf-o=input_format=yuyv422,video_size=1920x1080,framerate=60 \
+        --profile=low-latency --no-cache --untimed --no-audio "$VDEV"
+    ;;
+
+  view-ffplay)
+    need_cmd ffplay ffmpeg
+    say "ffplay で $VDEV 表示..."
+    exec ffplay -f v4l2 -input_format yuyv422 -video_size 1920x1080 -framerate 60 \
+      -fflags nobuffer -flags low_delay -sync ext \
+      -x 1280 -y 720 -vf 'scale=1280:720' "$VDEV"
+    ;;
+
+  view-guvc)
+    need_cmd guvcview guvcview
+    exec guvcview -d "$VDEV" -x 1280x720
+    ;;
+
+  audio-test)
+    SEC="${SEC:-6}"
+    prep
+    kill_capture
+    say "音声だけテスト ${SEC}秒..."
+    sudo ./iso_capture "$SEC" 2 5
+    say "stream-iso.bin から SEP 抜き出し..."
+    ./audio_extract captures/stream-iso.bin captures/sep.raw
+    ffmpeg -f s16le -ar 48000 -ac 2 -i captures/sep.raw -y captures/sep.wav 2>&1 | tail -3
+    say "captures/sep.wav 完成。'aplay captures/sep.wav' で確認"
+    ;;
+
+  pt)
+    SEC="${SEC:-60}"
+    prep
+    say "パススルー実験 (poststream発火) ${SEC}秒..."
+    exec sudo ./iso_capture "$SEC" 2 5 "" pt
+    ;;
+
+  ptx)
+    SEC="${SEC:-60}"
+    prep
+    say "パススルー実験 + 解放シーケンス ${SEC}秒..."
+    exec sudo ./iso_capture "$SEC" 2 5 "" pt release
+    ;;
+
+  test)
+    SEC="${SEC:-20}"
+    prep
+    say "短時間テスト ${SEC}秒 (stats見る用)..."
+    exec sudo ./iso_capture "$SEC" 2 5
+    ;;
+
+  minimal)
+    SEC="${SEC:-30}"
+    prep
+    say "**最小モード** ${SEC}秒: reset/init/burst 省略 (passthrough 保護狙い)"
+    say "HD60S を USB 抜き差し直後の状態で使ってください"
+    exec sudo HD60S_NO_RESET=1 HD60S_SKIP_INIT=1 HD60S_SKIP_BURST=1 ./iso_capture "$SEC" 2 5
+    ;;
+
+  stop)
+    say "iso_capture 停止中..."
+    kill_capture
+    tmux kill-session -t hd60s 2>/dev/null || true
+    say "完了"
+    ;;
+
+  color-test)
+    # 深緑色化の修正テスト: init-p2-color.tsv (InfoFrame command 復活版) 使用
+    SEC="${SEC:-30}"
+    prep
+    say "色空間修正テスト ${SEC}秒: init-p2-color.tsv (InfoFrame 復活版)"
+    exec sudo -E HD60S_INIT_TSV=analysis/init-p2-color.tsv ./iso_capture "$SEC" 2 5
+    ;;
+
+  audio-v2)
+    # IT6802 正しい reg (0x7D 系) で音声 unmute リトライ
+    SEC="${SEC:-30}"
+    prep
+    say "音声 unmute V2 テスト ${SEC}秒: IT6802 REG_RX_HWMuteCtrl=0x7D 使用"
+    exec sudo -E HD60S_AUDIO_V2=1 ./iso_capture "$SEC" 2 5
+    ;;
+
+  audio-win)
+    # Windows Elgato pcap から抽出した audio init コマンドを merge した init 使う
+    SEC="${SEC:-15}"
+    prep
+    say "Windows audio init merge テスト ${SEC}秒: init-p2-audio.tsv 使用"
+    exec sudo -E HD60S_INIT_TSV=analysis/init-p2-audio.tsv ./iso_capture "$SEC" 2 5
+    ;;
+
+  busy)
+    say "$VDEV 掴んでるプロセス:"
+    sudo fuser -v "$VDEV" 2>&1 || echo "  (何も掴んでない)"
+    ;;
+
+  doctor)
+    echo "== hd60s doctor =="
+    ok=0; ng=0
+    chk() {
+        if eval "$2" >/dev/null 2>&1; then
+            printf "  [OK] %s\n" "$1"; ok=$((ok+1))
+        else
+            printf "  [NG] %s\n     → %s\n" "$1" "$3"; ng=$((ng+1))
+        fi
+    }
+    chk "iso_capture ビルド済み"   "[ -x ./iso_capture ]"                     "cd $(pwd) && make"
+    chk "HD60S 接続 (USB 0fd9:0074)" "lsusb | grep -qi 0fd9:0074"              "USB ケーブル/電源を確認"
+    chk "v4l2loopback ロード済み"  "lsmod | grep -q v4l2loopback"              "sudo modprobe v4l2loopback video_nr=42 card_label=HD60S exclusive_caps=0"
+    chk "$VDEV 存在"               "[ -e $VDEV ]"                              "v4l2loopback を video_nr=42 でロード"
+    chk "snd-aloop ロード済み"     "lsmod | grep -q snd_aloop"                 "sudo modprobe snd-aloop enable=1 index=10 id=hd60s pcm_substreams=1"
+    chk "v4l2loopback-ctl コマンド" "command -v v4l2loopback-ctl"              "sudo apt install -y v4l2loopback-utils"
+    chk "vlc コマンド"             "command -v vlc"                            "sudo apt install -y vlc"
+    chk "mpv コマンド"             "command -v mpv"                            "sudo apt install -y mpv"
+    chk "ffmpeg/ffplay"            "command -v ffplay"                         "sudo apt install -y ffmpeg"
+    chk "tmux"                     "command -v tmux"                           "sudo apt install -y tmux"
+    chk "obs"                      "command -v obs"                            "sudo apt install -y obs-studio"
+    echo
+    echo "結果: OK=$ok / NG=$ng"
+    [ "$ng" = 0 ] && echo "全部OK。'hd60s live' でいける" || echo "'hd60s install-deps' で足りないやつまとめて入る"
+    ;;
+
+  install-deps)
+    say "apt package まとめてインストール..."
+    need_sudo
+    PKGS=(build-essential pkg-config libusb-1.0-0-dev
+          v4l2loopback-dkms v4l2loopback-utils linux-headers-$(uname -r)
+          ffmpeg vlc mpv guvcview tmux obs-studio)
+    sudo apt update
+    sudo apt install -y "${PKGS[@]}"
+    say "完了。'hd60s doctor' で確認して"
+    ;;
+
+  help|--help|-h|"")
+    cat <<EOF
+HD60S ドライバ実験ラッパー
+
+使い方: hd60s <command> [引数]
+
+── 見る / 使う ────────────────────────────
+  live           tmux 1枚で iso_capture + VLC 同時起動 (おすすめ)
+  obs            iso_capture 裏で起動 → OBS 立ち上げ
+  start [秒]     iso_capture をフォアグラウンドで走らせる (既定600s)
+  view           VLC で $VDEV + 音声($ADEV) 表示
+  view-mpv       mpv で表示 (Wayland native, 映像のみ)
+  view-ffplay    ffplay で表示 (代替)
+  view-guvc      guvcview で表示
+
+── 実験 / デバッグ ────────────────────────
+  test [秒]      短時間テスト (既定20s, stats確認用)
+  minimal [秒]   最小モード (init/burst省略、passthrough保護, 既定30s)
+  pt   [秒]      パススルー実験 (poststream発火, 既定60s)
+  ptx  [秒]      パススルー実験 + 解放シーケンス (既定60s)
+  audio-test [秒] 音声抽出だけ (sep.wav 出力, 既定6s)
+  color-test [秒] 色空間修正テスト: init-p2-color.tsv (InfoFrame復活版, 既定30s)
+  audio-v2 [秒]  IT6802 正しいreg (0x7D 系) で音声unmute試行 (既定30s)
+
+── メンテ ─────────────────────────────
+  stop           走ってる iso_capture を全部止める
+  busy           $VDEV を掴んでるプロセス表示
+  doctor         環境診断 (依存パッケージ/カーネルモジュール/デバイス)
+  install-deps   必要な apt package を一括インストール
+  help           このヘルプ
+
+デバイス: 映像=$VDEV / 音声=$ADEV
+EOF
+    ;;
+
+  *)
+    err "unknown command: $CMD"
+    echo "'hd60s help' でコマンド一覧見て"
+    exit 1
+    ;;
+esac

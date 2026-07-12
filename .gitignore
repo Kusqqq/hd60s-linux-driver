@@ -1,0 +1,48 @@
+# Node
+node_modules/
+
+# Build artifacts (hd60s は shell script なので除外しない)
+*.o
+*.obj
+*.a
+iso_capture
+audio_extract
+offline_parser
+ep81_probe
+spi_dump
+
+# Runtime output
+captures/
+!captures/proof/.gitkeep
+
+# Elgato reference materials (再配布不可 — 各自 Windows ドライバ install から抽出)
+reference/*.dll
+reference/*.DLL
+reference/*.sys
+reference/*.SYS
+reference/*.inf
+reference/*.INF
+!reference/it680x_regs.h
+
+# Elgato firmware (再配布不可)
+firmware/*.bin
+firmware/*.img
+firmware/*.fw
+
+# Large binary captures / analysis intermediates
+*.pcapng
+*.pcap
+analysis/audio_hunt/*.wav
+analysis/audio_hunt/*.raw
+analysis/audio_hunt/*.bin
+
+# FX3 firmware disassembly (large intermediate files, generate locally)
+*.dis
+*.asm
+scratchpad/
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+*.swp
