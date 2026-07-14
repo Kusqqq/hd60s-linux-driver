@@ -173,15 +173,9 @@ make iso_capture
 
 Anthropic の Claude を活用させていただきました。
 
-### 詳細な RE 経緯
-
-`FINDINGS.md` に、数日間の解析ジャーニー・仮説と反証・突破口の詳細を時系列で残してあります (日本語)。同様の HD60 系 (HD60 X / 4K60 S+ 等) の RE に取り組む人の参考になれば。
-
 ---
 
 ## 主な技術発見 (RE ノート抜粋)
-
-以下は詳細な `FINDINGS.md` からのハイライト:
 
 ### チップ構成
 HD60 S は 5 チップ構成: **Cypress FX3** (USB3 SuperSpeed) + **Nuvoton M031** MCU + **IT6802E** (HDMI RX) + **IT66121** (HDMI TX) + **Altera MAX II** CPLD + **W25Q32JV** SPI flash
