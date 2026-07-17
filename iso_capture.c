@@ -28,6 +28,8 @@
 #include <sys/time.h>
 #include <sys/ioctl.h>
 #include <fcntl.h>
+#include <stdatomic.h>
+#include <stdalign.h>
 #include <linux/videodev2.h>
 #include <sys/mman.h>
 #include <sys/resource.h>
@@ -203,8 +205,21 @@ static void audio_feed_sep(const uint8_t* payload) {
         if (el < 2.0 || g_sep_count < 500) return;
         double sep_rate = g_sep_count / el;
         double effective_sample_rate = sep_rate * 4.0;
-        if (effective_sample_rate < 4000.0 || effective_sample_rate > 200000.0) {
+        // 2026-07-18 3-way snap: 48/96/192 kHz の HDMI 音源に対応。
+        // 起動直後の SEP 取りこぼしで実効レートが誤検出されても、最近傍の "常識的"
+        // レートに snap することで upsample 比率暴走で波形歪む問題を防ぐ。
+        // - 47-49 kHz: 48 kHz (PS5/Xbox/PC HDMI 出力の一般値)
+        // - 95-97 kHz: 96 kHz (Switch)
+        // - 190-194 kHz: 192 kHz (稀、高音質 AV 機器)
+        // - どれにも該当しない = 判別不能 → 96 kHz デフォルト (kusq 常用)
+        if (effective_sample_rate >= 47000.0 && effective_sample_rate <= 49000.0) {
+            effective_sample_rate = 48000.0;
+        } else if (effective_sample_rate >= 95000.0 && effective_sample_rate <= 97000.0) {
             effective_sample_rate = 96000.0;
+        } else if (effective_sample_rate >= 190000.0 && effective_sample_rate <= 194000.0) {
+            effective_sample_rate = 192000.0;
+        } else {
+            effective_sample_rate = 96000.0;  // 判別不能 → Switch 想定デフォルト
         }
         g_upsample_ratio = 96000.0 / effective_sample_rate;
         fprintf(stderr, "[audio] measured: %.1f SEP/s → %.0f Hz eff → upsample %.3fx to 96kHz\n",
@@ -254,17 +269,26 @@ static struct pw_stream* g_pw_stream = NULL;
 #define PW_RING_SIZE 4096
 // PW スレッドが「読み残し」しないように、目標水位 = 1 quantum 分 (128 samples ~1.3ms).
 #define PW_TARGET_FILL 256
-static int16_t g_pw_ring[PW_RING_SIZE];
-static volatile uint32_t g_pw_ring_head = 0;  // producer write index (iso スレッド)
-static volatile uint32_t g_pw_ring_tail = 0;  // consumer read index (pw スレッド)
-static pthread_mutex_t g_pw_ring_lock = PTHREAD_MUTEX_INITIALIZER;
+// 2026-07-18 lock-free SPSC ring: producer は head のみ更新、consumer は tail のみ更新。
+// pthread_mutex 撤廃で priority inversion (RT thread が producer の mutex を待つ) を根絶。
+// release/acquire ordering で書いた samples が cross-thread に可視化されることを保証。
+// alignas(64): false sharing 回避 (producer/consumer が別 CPU で走る時、head と tail が
+// 同じキャッシュラインだと片方書くたびに逆側 invalidate = SPSC のコアメリット消える)。
+alignas(64) static _Atomic uint32_t g_pw_ring_head = 0;  // producer 専用 (iso スレッド)
+alignas(64) static _Atomic uint32_t g_pw_ring_tail = 0;  // consumer 専用 (pw スレッド)
+alignas(64) static int16_t g_pw_ring[PW_RING_SIZE];
+// drop counters (障害調査用、毎秒 24k SEP でも atomic incr のオーバーヘッド無視可)
+static _Atomic uint64_t g_pw_drops_old = 0;   // consumer 側 fast-forward した sample 数
+static _Atomic uint64_t g_pw_drops_new = 0;   // producer 側で full により書けなかった数
 
 // PW process コールバック用の状態
 static int16_t g_pw_last_sample = 0;  // underflow 時の連続性維持用
 
-// pw_stream process コールバック: PipeWire スレッドから呼ばれる。ring から
+// pw_stream process コールバック: PipeWire RT スレッドから呼ばれる。ring から
 // dequeue して PW バッファに書き込む。
 // 🔥 音割れ対策: underflow 時は 0 埋めでなく last_sample を decay させる
+// 🔥 2026-07-18 lock-free SPSC: producer と mutex 争わない。溜まりすぎ時の drop-old
+//    責任を consumer 側に集約 (SPSC の tail 単一書き込み者ルールを守るため)。
 static void pw_on_process(void* userdata) {
     (void)userdata;
     struct pw_buffer* b = pw_stream_dequeue_buffer(g_pw_stream);
@@ -275,13 +299,25 @@ static void pw_on_process(void* userdata) {
     int16_t* dst = (int16_t*)buf->datas[0].data;
     uint32_t max_frames = buf->datas[0].maxsize / sizeof(int16_t);
     uint32_t want = b->requested;
-    if (want == 0 || want > max_frames) want = max_frames;
+    // requested==0 は「PW 側で決めて」の合図。max_frames まで消費すると ring 空 →
+    // 次コールで無音 40ms、なので 1 quantum 目安の TARGET_FILL に抑える
+    if (want == 0) want = PW_TARGET_FILL;
+    if (want > max_frames) want = max_frames;
 
-    pthread_mutex_lock(&g_pw_ring_lock);
-    uint32_t head = g_pw_ring_head;
-    uint32_t tail = g_pw_ring_tail;
+    // acquire: producer が書いた samples が可視化されることを保証
+    uint32_t head = atomic_load_explicit(&g_pw_ring_head, memory_order_acquire);
+    uint32_t tail = atomic_load_explicit(&g_pw_ring_tail, memory_order_relaxed);
     uint32_t avail = (head - tail) & (PW_RING_SIZE - 1);
-    pthread_mutex_unlock(&g_pw_ring_lock);
+
+    // 2026-07-18 soft-drop: 一度に大量捨てると可聴クリックが出るので、TARGET*3 (~8ms)
+    // 超えを検出したら 128 samples (1.3ms, 1 quantum) だけ捨てる。発動頻度は上がるが
+    // 1 回のジャンプが小さくなりクリック体感 << ハード drop。
+    if (avail > PW_TARGET_FILL * 3) {
+        uint32_t drop = 128;
+        tail = (tail + drop) & (PW_RING_SIZE - 1);
+        avail = (head - tail) & (PW_RING_SIZE - 1);
+        atomic_fetch_add_explicit(&g_pw_drops_old, drop, memory_order_relaxed);
+    }
 
     uint32_t n = (want < avail) ? want : avail;
     for (uint32_t i = 0; i < n; i++) {
@@ -298,9 +334,11 @@ static void pw_on_process(void* userdata) {
     }
     g_pw_last_sample = decay;
 
-    pthread_mutex_lock(&g_pw_ring_lock);
-    g_pw_ring_tail = (tail + n) & (PW_RING_SIZE - 1);
-    pthread_mutex_unlock(&g_pw_ring_lock);
+    // release: 次の pop_process 呼び出し時に、samples 読み込みより先に tail 更新が
+    // 見えても副作用ないよう (自分自身しか tail 書かないので単純だが、producer 側の
+    // fill 判定に影響するので明示的に release)
+    atomic_store_explicit(&g_pw_ring_tail, (tail + n) & (PW_RING_SIZE - 1),
+                          memory_order_release);
 
     buf->datas[0].chunk->offset = 0;
     buf->datas[0].chunk->stride = sizeof(int16_t);
@@ -313,30 +351,28 @@ static const struct pw_stream_events g_pw_events = {
     .process = pw_on_process,
 };
 
-// ring バッファに samples 書き込み (iso スレッドから)
-// 🔥 低遅延化: 溜まりすぎたら古いのから破棄。目標 fill レベルを維持。
-static void pw_ring_push(int16_t sample) {
-    pthread_mutex_lock(&g_pw_ring_lock);
-    uint32_t fill = (g_pw_ring_head - g_pw_ring_tail) & (PW_RING_SIZE - 1);
-    if (fill >= PW_RING_SIZE - 8) {
-        // ring full: drop oldest (advance tail by 1)
-        g_pw_ring_tail = (g_pw_ring_tail + 1) & (PW_RING_SIZE - 1);
+// ring バッファに samples を batch で書き込む (iso スレッドから)
+// 🔥 2026-07-18 lock-free SPSC + batch: 従来 per-sample の mutex を排除。
+//    full なら drop-new (書かない)。drop-old ロジックは consumer (pw_on_process) 側で。
+static void pw_ring_push_batch(const int16_t* samples, int n) {
+    if (n <= 0) return;
+    // relaxed: head は自分専用書き込み、ここでは最新値だけ拾えれば OK
+    uint32_t head = atomic_load_explicit(&g_pw_ring_head, memory_order_relaxed);
+    // acquire: consumer が tail を進めた分の空き space が自分に見えるように
+    uint32_t tail = atomic_load_explicit(&g_pw_ring_tail, memory_order_acquire);
+    uint32_t fill = (head - tail) & (PW_RING_SIZE - 1);
+    uint32_t space = PW_RING_SIZE - 1 - fill;   // -1 は full/empty 区別のため
+    int to_write = (n < (int)space) ? n : (int)space;
+    int dropped = n - to_write;
+    if (dropped > 0) {
+        atomic_fetch_add_explicit(&g_pw_drops_new, (uint64_t)dropped, memory_order_relaxed);
     }
-    g_pw_ring[g_pw_ring_head] = sample;
-    g_pw_ring_head = (g_pw_ring_head + 1) & (PW_RING_SIZE - 1);
-    pthread_mutex_unlock(&g_pw_ring_lock);
-}
-
-// 🔥 iso スレッドから: fill を slow correction する。ハードな drop はクリック音を
-// 生むので、毎 SEP に少しずつだけ tail を進めて滑らかに追いつく。
-static void pw_ring_trim_if_too_full(void) {
-    pthread_mutex_lock(&g_pw_ring_lock);
-    uint32_t fill = (g_pw_ring_head - g_pw_ring_tail) & (PW_RING_SIZE - 1);
-    // target の 4倍超えたら 1 sample だけ捨てる。徐々に減っていく。
-    if (fill > PW_TARGET_FILL * 4) {
-        g_pw_ring_tail = (g_pw_ring_tail + 1) & (PW_RING_SIZE - 1);
+    for (int i = 0; i < to_write; i++) {
+        g_pw_ring[(head + i) & (PW_RING_SIZE - 1)] = samples[i];
     }
-    pthread_mutex_unlock(&g_pw_ring_lock);
+    // release: consumer が新しい head を見た時に samples 書き込みも見えることを保証
+    atomic_store_explicit(&g_pw_ring_head, (head + to_write) & (PW_RING_SIZE - 1),
+                          memory_order_release);
 }
 
 static void audio_pw_open(void) {
@@ -426,8 +462,21 @@ static void audio_feed_sep_pw(const uint8_t* payload) {
         if (el < 2.0 || g_sep_count < 500) return;
         double sep_rate = g_sep_count / el;
         double effective_sample_rate = sep_rate * 4.0;
-        if (effective_sample_rate < 4000.0 || effective_sample_rate > 200000.0) {
+        // 2026-07-18 3-way snap: 48/96/192 kHz の HDMI 音源に対応。
+        // 起動直後の SEP 取りこぼしで実効レートが誤検出されても、最近傍の "常識的"
+        // レートに snap することで upsample 比率暴走で波形歪む問題を防ぐ。
+        // - 47-49 kHz: 48 kHz (PS5/Xbox/PC HDMI 出力の一般値)
+        // - 95-97 kHz: 96 kHz (Switch)
+        // - 190-194 kHz: 192 kHz (稀、高音質 AV 機器)
+        // - どれにも該当しない = 判別不能 → 96 kHz デフォルト (kusq 常用)
+        if (effective_sample_rate >= 47000.0 && effective_sample_rate <= 49000.0) {
+            effective_sample_rate = 48000.0;
+        } else if (effective_sample_rate >= 95000.0 && effective_sample_rate <= 97000.0) {
             effective_sample_rate = 96000.0;
+        } else if (effective_sample_rate >= 190000.0 && effective_sample_rate <= 194000.0) {
+            effective_sample_rate = 192000.0;
+        } else {
+            effective_sample_rate = 96000.0;  // 判別不能 → Switch 想定デフォルト
         }
         g_upsample_ratio = 96000.0 / effective_sample_rate;
         fprintf(stderr, "[audio-pw] measured: %.1f SEP/s → %.0f Hz eff → upsample %.3fx to 96kHz\n",
@@ -439,24 +488,28 @@ static void audio_feed_sep_pw(const uint8_t* payload) {
     }
     if (!g_pw_stream || g_upsample_ratio <= 0) return;
 
+    // 2026-07-18 batch push 化: upsample_ratio は最大 2.0x (48kHz 音源 snap 時) まで、
+    // 4 payload samples × ceil(2.0) = 8 が典型最大、余裕を持って 32 バッファ。
+    // (192kHz snap 時は ratio=0.5、samples/payload が減るので同じく余裕内)
+    int16_t batch[32];
+    int bi = 0;
     const int16_t* s = (const int16_t*)payload;
     for (int k = 0; k < 4; k++) {
         int16_t cur = s[k];
         double count = g_upsample_ratio + g_frac_pos;
         int n = (int)count;
         g_frac_pos = count - n;
-        for (int i = 1; i <= n; i++) {
+        for (int i = 1; i <= n && bi < (int)(sizeof(batch)/sizeof(batch[0])); i++) {
             double t = (double)i / (double)(n > 0 ? n : 1);
             double v = g_last_sample + (cur - g_last_sample) * t;
             if (v > 32767.0) v = 32767.0;
             if (v < -32768.0) v = -32768.0;
-            pw_ring_push((int16_t)v);
+            batch[bi++] = (int16_t)v;
         }
         g_last_sample = cur;
     }
-    // 低遅延化: ring が溜まりすぎたら余剰破棄 (upsample_ratio と PW クロックの微妙な差
-    // で徐々に fill が増える → 遅延が延びる) を防ぐ
-    pw_ring_trim_if_too_full();
+    // ロックなしで 1 回だけ push。drop-old (溜まりすぎ制御) は consumer 側で吸収。
+    pw_ring_push_batch(batch, bi);
 }
 
 // フラグ: PipeWire ネイティブモード (前方宣言済)
@@ -495,15 +548,22 @@ static void emit_frame(void) {
         if (w != FRAME_BYTES) fprintf(stderr, "[v4l2] short write %zd\n", w);
     }
     g_frames_out++;
-    // 60,120,300,600フレームの生YUYVを保存（検証用）
-    if (g_frames_out == 60 || g_frames_out == 300 || g_frames_out == 600) {
+    // 2026-07-18 debug dump は HD60S_DEBUG_DUMP=1 の時のみ (常時 4MB × 3 個の write は無駄)
+    if (getenv("HD60S_DEBUG_DUMP") &&
+        (g_frames_out == 60 || g_frames_out == 300 || g_frames_out == 600)) {
         char path[256];
         snprintf(path, sizeof(path), "captures/proof/live_frame_%llu.yuv", g_frames_out);
         FILE* fp = fopen(path, "wb");
         if (fp) { fwrite(g_framebuf, 1, FRAME_BYTES, fp); fclose(fp);
                   fprintf(stderr, "[dump] %s\n", path); }
     }
-    if ((g_frames_out % 60) == 0) fprintf(stderr, "[emit] %llu frames\n", g_frames_out);
+    // 2026-07-18 [emit] を毎秒 → 5秒 (300 frames = 60fps × 5s) に。
+    // stall 検知には十分早く、journal 汚染も 1/5 に抑えつつバランス取り。
+    // HD60S_VERBOSE=1 で毎秒 (60 frames)、以前と同じ verbose に。
+    static int verbose_checked = 0, verbose = 0;
+    if (!verbose_checked) { verbose = getenv("HD60S_VERBOSE") ? 1 : 0; verbose_checked = 1; }
+    unsigned long long interval = verbose ? 60 : 300;
+    if ((g_frames_out % interval) == 0) fprintf(stderr, "[emit] %llu frames\n", g_frames_out);
 }
 
 // data/len を消費してパーサに突っ込む。iso packet 最大32768B、pending 最大16Bなので
@@ -749,7 +809,7 @@ static void replay_spell(libusb_device_handle* h, const char* path) {
                 // 直近と違う応答だけ表示(変化点を捉える)
                 if (strcmp(hex, last5066) != 0) {
                     fprintf(stderr, "  [poll@%.2fs] wV5066 resp: %s\n", t, hex);
-                    strncpy(last5066, hex, sizeof(last5066)-1);
+                    snprintf(last5066, sizeof(last5066), "%s", hex);
                 }
                 n5066++;
             }
@@ -1128,7 +1188,7 @@ int main(int argc, char** argv) {
         }
     }
 
-    // IT6802E audio unmute V2 — 正しい register (IT6802 register spec より)
+    // IT6802E audio unmute V2 — 正しい register (DB_C10 SDK it680x_regs.h 参照)
     // 環境変数 HD60S_AUDIO_V2=1 で有効化
     // Fable が参考にした IT6604 spec は reg 0x87 だが、IT6802 (実際の HD60S 用チップ) の
     // REG_RX_HWMuteCtrl は 0x7D。それ以外の関連 reg も一緒に叩く。
@@ -1443,7 +1503,7 @@ int main(int argc, char** argv) {
         }
 
         // 🔥 IT6802 AUDIO RECOVERY LOOP (2026-07-11 Fable + FIX_ID_023 breakthrough)
-        // IT6802 の AudioFsCal + aud_fiforst + Force FS 相当を再現。
+        // ITE公式ドライバ it680x.c の AudioFsCal() + aud_fiforst() + Force FS を再現。
         // 100ms周期で HW mute解除 + 48kHz強制 + I2S untri-state を再送。
         // HD60S_IT6802_RECOVER=1 で有効化。IT6802 access = I2C slave 0x94 (write) bank 0
         static double last_it6802_rec = 0.0;
@@ -1553,8 +1613,6 @@ int main(int argc, char** argv) {
         // 環境変数 HD60S_PLL_MON=1 で有効化
         static double last_pll_mon = 0.0;
         static int pll_mon_fires = 0;
-        static unsigned char pll_history[64] = {0};
-        static int pll_hist_pos = 0;
         const char* env_pll_mon = getenv("HD60S_PLL_MON");
         int pll_mon = (env_pll_mon && env_pll_mon[0] && env_pll_mon[0] != '0');
         if (pll_mon && (el - last_pll_mon) >= 0.020) {
@@ -1776,6 +1834,11 @@ int main(int argc, char** argv) {
             g_frames_out, g_resyncs, g_resync_empty, g_resync_marker, g_resync_overflow);
     fprintf(stderr, "audio:     frames=%llu underrun=%llu (%.2f s at 48kHz)\n",
             g_audio_frames, g_audio_underrun, g_audio_frames / 48000.0);
+    // 2026-07-18 drop counters (PW ring): クリック/ジッター起因の切り分け用
+    uint64_t drops_old = atomic_load_explicit(&g_pw_drops_old, memory_order_relaxed);
+    uint64_t drops_new = atomic_load_explicit(&g_pw_drops_new, memory_order_relaxed);
+    fprintf(stderr, "pw ring:   drops_old=%llu (consumer fast-forward) drops_new=%llu (producer full)\n",
+            (unsigned long long)drops_old, (unsigned long long)drops_new);
 
     libusb_release_interface(h, 0);
     libusb_close(h);
