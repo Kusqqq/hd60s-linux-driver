@@ -1581,12 +1581,15 @@ int main(int argc, char** argv) {
             //    default 0x00 → 0x02 → 0x00
             IT6802W(0x10, 0x02);
             IT6802W(0x10, 0x00);
-            // 5) Force FS = 48kHz (FIX_ID_023): REG_RX_074 bit6 + REG_RX_07B x 4
+            // 5) Force FS = 96kHz (FIX_ID_023 の Switch 96kHz 整合版, 2026-07-19)
+            // 元は B_48K (0x02) だったが Switch の 96kHz 入力と衝突して I2S FIFO が
+            // 周期的に reset → 高音ジリジリの副作用 (Opus 4.8 review 6-4 指摘)。
+            // ITE SDK it680x_regs.h: #define B_96K 0x0A / B_FS_96000 (10<<0)
             IT6802W(0x74, 0xe0);   // 0xA0 base + 0x40 (B_Force_FS)
-            IT6802W(0x7b, 0x02);   // B_48K
-            IT6802W(0x7b, 0x02);
-            IT6802W(0x7b, 0x02);
-            IT6802W(0x7b, 0x02);
+            IT6802W(0x7b, 0x0A);   // B_96K (Switch 音源と整合)
+            IT6802W(0x7b, 0x0A);
+            IT6802W(0x7b, 0x0A);
+            IT6802W(0x7b, 0x0A);
             // 5b) REG_RX_075 = 0x40: Audio 24bit → 16bit conversion (ITE init default)
             IT6802W(0x75, 0x40);
             // 5c) Fable's MCLK 256fs hint: reg 0x54 bits[5:4] = 01 (HBR mode = 128fs)
