@@ -30,6 +30,7 @@
 #include <fcntl.h>
 #include <stdatomic.h>
 #include <stdalign.h>
+#include <samplerate.h>
 #include <linux/videodev2.h>
 #include <sys/mman.h>
 #include <sys/resource.h>
@@ -351,6 +352,11 @@ static const struct pw_stream_events g_pw_events = {
     .process = pw_on_process,
 };
 
+// 2026-07-19 libsamplerate 導入: linear interp の高音色付け (Opus 4.8 A1 指摘) 対策。
+// SRC_SINC_MEDIUM_QUALITY = 位相・振幅ともに ~-100 dB THD、i7-12700 で <1% CPU 予想。
+static SRC_STATE* g_src = NULL;
+static int g_src_ok = 0;
+
 // ring バッファに samples を batch で書き込む (iso スレッドから)
 // 🔥 2026-07-18 lock-free SPSC + batch: 従来 per-sample の mutex を排除。
 //    full なら drop-new (書かない)。drop-old ロジックは consumer (pw_on_process) 側で。
@@ -436,6 +442,18 @@ static void audio_pw_open(void) {
     pw_thread_loop_unlock(g_pw_loop);
     pw_thread_loop_start(g_pw_loop);
     fprintf(stderr, "[audio-pw] PipeWire ネイティブ stream 起動 (96kHz S16_LE mono, latency=128/48000=2.6ms)\n");
+
+    // 2026-07-19 libsamplerate 初期化 (SINC MEDIUM QUALITY): linear interp より
+    // 位相・振幅の色付けが激減。SEP レート測定完了後に src_ratio を set する。
+    int src_err = 0;
+    g_src = src_new(SRC_SINC_MEDIUM_QUALITY, 1, &src_err);
+    if (!g_src) {
+        fprintf(stderr, "[audio-pw] src_new failed: %s → linear fallback\n", src_strerror(src_err));
+        g_src_ok = 0;
+    } else {
+        g_src_ok = 1;
+        fprintf(stderr, "[audio-pw] libsamplerate SINC_MEDIUM_QUALITY 有効\n");
+    }
 }
 
 static void audio_pw_close(void) {
@@ -447,6 +465,7 @@ static void audio_pw_close(void) {
     }
     pw_thread_loop_destroy(g_pw_loop);
     g_pw_loop = NULL;
+    if (g_src) { src_delete(g_src); g_src = NULL; g_src_ok = 0; }
     pw_deinit();
 }
 
@@ -488,12 +507,40 @@ static void audio_feed_sep_pw(const uint8_t* payload) {
     }
     if (!g_pw_stream || g_upsample_ratio <= 0) return;
 
-    // 2026-07-18 batch push 化: upsample_ratio は最大 2.0x (48kHz 音源 snap 時) まで、
-    // 4 payload samples × ceil(2.0) = 8 が典型最大、余裕を持って 32 バッファ。
-    // (192kHz snap 時は ratio=0.5、samples/payload が減るので同じく余裕内)
+    // 2026-07-19 libsamplerate (SINC 補間) 経路。使えない時は旧 linear interp に fallback。
+    const int16_t* s = (const int16_t*)payload;
+    if (g_src_ok) {
+        // int16 → float [-1,1)
+        float input[4];
+        for (int k = 0; k < 4; k++) input[k] = (float)s[k] / 32768.0f;
+        float output[32];  // 48kHz snap 時 ratio=2.0 → 8 samples 出、余裕 32
+        SRC_DATA data = {
+            .data_in = input,
+            .input_frames = 4,
+            .data_out = output,
+            .output_frames = (long)(sizeof(output)/sizeof(output[0])),
+            .src_ratio = g_upsample_ratio,
+            .end_of_input = 0,
+        };
+        int r = src_process(g_src, &data);
+        if (r == 0) {
+            int16_t batch[32];
+            int bi = 0;
+            for (long i = 0; i < data.output_frames_gen && bi < 32; i++) {
+                float v = output[i] * 32768.0f;
+                if (v > 32767.0f) v = 32767.0f;
+                if (v < -32768.0f) v = -32768.0f;
+                batch[bi++] = (int16_t)v;
+            }
+            pw_ring_push_batch(batch, bi);
+            return;
+        }
+        // src_process 失敗時は fallback へ落ちる (稀)
+    }
+
+    // Fallback: 旧 linear interp (libsamplerate init 失敗時のみ)
     int16_t batch[32];
     int bi = 0;
-    const int16_t* s = (const int16_t*)payload;
     for (int k = 0; k < 4; k++) {
         int16_t cur = s[k];
         double count = g_upsample_ratio + g_frac_pos;
@@ -508,7 +555,6 @@ static void audio_feed_sep_pw(const uint8_t* payload) {
         }
         g_last_sample = cur;
     }
-    // ロックなしで 1 回だけ push。drop-old (溜まりすぎ制御) は consumer 側で吸収。
     pw_ring_push_batch(batch, bi);
 }
 
