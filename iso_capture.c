@@ -357,6 +357,14 @@ static const struct pw_stream_events g_pw_events = {
 static SRC_STATE* g_src = NULL;
 static int g_src_ok = 0;
 
+// 2026-07-19 PLL 化 (Opus 4.8 P1-4): 静的な upsample_ratio が HD60S crystal と
+// PW clock の drift (100ppm 級) で時間経過とともに ring がずれ、ジリジリ蓄積する
+// 問題への対策。1 秒周期で ring fill error を PI 制御で g_upsample_ratio に微反映。
+static double g_pll_last_update = 0.0;
+static double g_pll_integral = 0.0;
+static double g_pll_base_ratio = 0.0;    // 初期測定値、暴走時にリセット可
+static uint64_t g_pll_updates = 0;
+
 // ring バッファに samples を batch で書き込む (iso スレッドから)
 // 🔥 2026-07-18 lock-free SPSC + batch: 従来 per-sample の mutex を排除。
 //    full なら drop-new (書かない)。drop-old ロジックは consumer (pw_on_process) 側で。
@@ -415,13 +423,16 @@ static void audio_pw_open(void) {
         return;
     }
 
-    // Audio format: S16 LE mono 96kHz (SEP native)
+    // 2026-07-21 P3-1: PW stream rate を 48kHz に統合。graph rate と一致するので
+    // PipeWire の内部 96→48 リサンプラー段が消滅、高音の色付け・ジッター (「ポポポ」
+    // 音の一因) の主犯を潰す。iso_capture 側で libsamplerate SINC が Switch 96kHz →
+    // 48kHz の anti-alias 込みダウンサンプルを担う。
     uint8_t buffer[1024];
     struct spa_pod_builder pod_builder = SPA_POD_BUILDER_INIT(buffer, sizeof(buffer));
     struct spa_audio_info_raw info = SPA_AUDIO_INFO_RAW_INIT(
         .format = SPA_AUDIO_FORMAT_S16_LE,
         .channels = 1,
-        .rate = 96000
+        .rate = 48000
     );
     const struct spa_pod* params[1];
     params[0] = spa_format_audio_raw_build(&pod_builder, SPA_PARAM_EnumFormat, &info);
@@ -441,7 +452,7 @@ static void audio_pw_open(void) {
 
     pw_thread_loop_unlock(g_pw_loop);
     pw_thread_loop_start(g_pw_loop);
-    fprintf(stderr, "[audio-pw] PipeWire ネイティブ stream 起動 (96kHz S16_LE mono, latency=128/48000=2.6ms)\n");
+    fprintf(stderr, "[audio-pw] PipeWire ネイティブ stream 起動 (48kHz S16_LE mono, PW graph 一致で downsample 段消去)\n");
 
     // 2026-07-19 libsamplerate 初期化 (SINC MEDIUM QUALITY): linear interp より
     // 位相・振幅の色付けが激減。SEP レート測定完了後に src_ratio を set する。
@@ -497,8 +508,12 @@ static void audio_feed_sep_pw(const uint8_t* payload) {
         } else {
             effective_sample_rate = 96000.0;  // 判別不能 → Switch 想定デフォルト
         }
-        g_upsample_ratio = 96000.0 / effective_sample_rate;
-        fprintf(stderr, "[audio-pw] measured: %.1f SEP/s → %.0f Hz eff → upsample %.3fx to 96kHz\n",
+        // 2026-07-21 P3-1: 48kHz stream 統合。Switch 96kHz なら ratio=0.5 (2:1 decimation)
+        // libsamplerate SINC が anti-alias LPF 込みで Nyquist 超え成分を除去する。
+        g_upsample_ratio = 48000.0 / effective_sample_rate;
+        g_pll_base_ratio = g_upsample_ratio;   // PLL の基準値として保存
+        g_pll_last_update = now_monotonic_s();
+        fprintf(stderr, "[audio-pw] measured: %.1f SEP/s → %.0f Hz eff → ratio %.3fx to 48kHz stream\n",
                 sep_rate, effective_sample_rate, g_upsample_ratio);
         g_measure_done = 1;
         g_last_sample = 0;
@@ -506,6 +521,51 @@ static void audio_feed_sep_pw(const uint8_t* payload) {
         return;
     }
     if (!g_pw_stream || g_upsample_ratio <= 0) return;
+
+    // 2026-07-19 PLL update: 1 秒周期で ring fill error から upsample_ratio を微調整。
+    // drift 起因の時間経過ジリジリ悪化を吸収する adaptive rate follow。
+    // ゲイン: 100ppm drift = 9.6 samples/s のズレ、Kp=1e-6, Ki=1e-7 で 30-60秒で追従。
+    // ⚠️ 2026-07-19 kusq 実聴: PLL が動的に ratio を変えることで "不協和音気味" の副作用
+    //    (音程がゆらぐ) 発生。default 無効化、HD60S_PLL_ENABLE=1 で opt-in に変更。
+    static int pll_checked = 0, pll_enabled = 0;
+    if (!pll_checked) {
+        pll_enabled = getenv("HD60S_PLL_ENABLE") ? 1 : 0;
+        pll_checked = 1;
+    }
+    if (pll_enabled) {
+        double now = now_monotonic_s();
+        double dt = now - g_pll_last_update;
+        if (dt >= 1.0) {
+            g_pll_last_update = now;
+            uint32_t head = atomic_load_explicit(&g_pw_ring_head, memory_order_relaxed);
+            uint32_t tail = atomic_load_explicit(&g_pw_ring_tail, memory_order_relaxed);
+            int32_t fill = (int32_t)((head - tail) & (PW_RING_SIZE - 1));
+            int32_t err = fill - (int32_t)PW_TARGET_FILL;  // +=溜まりすぎ、-=足りない
+            g_pll_integral += (double)err * dt;
+            // 積分暴走防止クランプ
+            if (g_pll_integral > 100000.0) g_pll_integral = 100000.0;
+            if (g_pll_integral < -100000.0) g_pll_integral = -100000.0;
+            double kp = 1e-6, ki = 1e-7;
+            double adjust = kp * (double)err + ki * g_pll_integral;
+            // 1 回の補正量にクランプ (暴走発振防止)
+            if (adjust > 5e-4) adjust = 5e-4;
+            if (adjust < -5e-4) adjust = -5e-4;
+            // ratio 減らす = 出力サンプル減る = 溜まってる時 (err>0) は減らす
+            double new_ratio = g_upsample_ratio - adjust;
+            // 基準値から ±5% を絶対上限 (95kHz snap 時 base=1.000, 範囲 [0.95, 1.05])
+            double lo = g_pll_base_ratio * 0.95;
+            double hi = g_pll_base_ratio * 1.05;
+            if (new_ratio < lo) new_ratio = lo;
+            if (new_ratio > hi) new_ratio = hi;
+            g_upsample_ratio = new_ratio;
+            g_pll_updates++;
+            if (getenv("HD60S_PLL_DEBUG")) {
+                fprintf(stderr, "[pll] #%llu fill=%d err=%+d int=%+.1f adj=%+.6f ratio=%.6f\n",
+                        (unsigned long long)g_pll_updates, fill, err,
+                        g_pll_integral, adjust, g_upsample_ratio);
+            }
+        }
+    }
 
     // 2026-07-19 libsamplerate (SINC 補間) 経路。使えない時は旧 linear interp に fallback。
     const int16_t* s = (const int16_t*)payload;
